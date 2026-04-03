@@ -1,0 +1,147 @@
+# 克隆自聚宽文章：https://www.joinquant.com/post/44901
+# 标题：首板低开策略
+# 作者：wywy1995
+
+# 风险及免责提示：该策略由聚宽用户在聚宽社区分享，仅供学习交流使用。
+# 原文一般包含策略说明，如有疑问请到原文和作者交流讨论。
+# 原文网址：https://www.joinquant.com/post/44901
+# 标题：首板低开策略
+# 作者：wywy1995
+# 原回测条件：2016-01-01 到 2023-11-11, ￥200000, 每天  Python3
+from jqdata import *
+import pandas as pd
+import datetime as dt
+
+def initialize(context):
+    set_option('use_real_price', True)
+    set_option('avoid_future_data', True)
+    log.set_level('system', 'error')
+    
+    run_daily(buy, time='09:30')
+    run_daily(sell, time='09:35')
+    run_daily(sell, time='11:28')
+    run_daily(sell, time='14:50')
+
+def buy(context):
+    if len(context.portfolio.positions) > 0:
+        return
+
+    curr_data = get_current_data()
+    yesterday = context.previous_date.strftime('%Y-%m-%d')
+    today = context.current_dt
+
+    # 1. 基础股票池
+    stock_list = get_all_securities(['stock'], date=yesterday).index.tolist()
+    
+    # 2. 【终极ST过滤：双重保险】
+    # 方法1：使用get_extras获取历史ST状态（最稳定）
+    st_df = get_extras('is_st', stock_list, start_date=yesterday, end_date=yesterday, df=True)
+    st_list = st_df.columns[st_df.iloc[0]].tolist()
+    
+    # 方法2：实时数据检查（兜底）
+    stock_list = [s for s in stock_list if s not in st_list and not curr_data[s].is_st]
+
+    # 3. 剔除科创板、北交所
+    stock_list = [s for s in stock_list if s[:2] != '68' and s[0] not in ['4','8']]
+    
+    # 4. 剔除上市不满1年新股
+    stock_list = [s for s in stock_list if (today.date() - get_security_info(s).start_date).days > 250]
+    
+    # 5. 剔除停牌股
+    stock_list = [s for s in stock_list if not curr_data[s].paused]
+
+    if not stock_list:
+        return
+
+    # 6. 昨日涨停
+    df = get_price(stock_list, end_date=yesterday, count=1, fields=['close','high_limit'], panel=False)
+    limit_up = df[df['close'] == df['high_limit']].code.tolist()
+    if not limit_up:
+        return
+
+    # 7. 首板判断
+    pre_df = get_price(limit_up, end_date=yesterday, count=2, fields=['close','high_limit'], panel=False)
+    first_limit = []
+    for code in limit_up:
+        c = pre_df[pre_df['code'] == code]['close'].tolist()
+        h = pre_df[pre_df['code'] == code]['high_limit'].tolist()
+        if len(c) >=2 and c[0] != h[0]:
+            first_limit.append(code)
+
+    if not first_limit:
+        return
+
+    # 8. 60日相对位置
+    df_pos = get_price(first_limit, end_date=yesterday, count=60, fields=['high','low','close'], panel=False).dropna()
+    rp = {}
+    for code in first_limit:
+        d = df_pos[df_pos['code'] == code]
+        if len(d) < 10:
+            continue
+        close = d['close'].iloc[-1]
+        low = d['low'].min()
+        high = d['high'].max()
+        rp[code] = (close - low) / (high - low) if high > low else 0
+
+    first_limit = [c for c in rp if rp[c] <= 0.5]
+    if not first_limit:
+        return
+
+    # 9. 低开3%-4%
+    yc = get_price(first_limit, end_date=yesterday, count=1, fields=['close'], panel=False).set_index('code')
+    buy_list = []
+    for code in first_limit:
+        open_p = curr_data[code].day_open
+        close_p = yc.loc[code, 'close']
+        if 0.96 <= open_p / close_p <= 0.97:
+            buy_list.append(code)
+
+    # 10. 买入（最终检查ST）
+    buy_list = [s for s in buy_list if s not in st_list and not curr_data[s].is_st]
+    if buy_list:
+        cash = context.portfolio.total_value / len(buy_list)
+        for code in buy_list:
+            order_target_value(code, cash)
+            log.info(f'买入：{get_security_info(code).display_name} {code}')
+
+def sell(context):
+    curr_data = get_current_data()
+    hold = list(context.portfolio.positions.keys())
+    if not hold:
+        return
+
+    t = context.current_dt.strftime('%H:%M:%S')
+    yesterday = context.previous_date.strftime('%Y-%m-%d')
+    
+    # 每日更新ST列表（防止盘中摘帽/加帽）
+    st_df = get_extras('is_st', hold, start_date=yesterday, end_date=yesterday, df=True)
+    st_list = st_df.columns[st_df.iloc[0]].tolist()
+
+    for code in hold:
+        # 持仓股也检查ST
+        if code in st_list or curr_data[code].is_st:
+            order_target_value(code, 0)
+            log.info(f'【发现ST，强制卖出】{code}')
+            continue
+            
+        pos = context.portfolio.positions[code]
+        cost = pos.avg_cost
+        now = curr_data[code].last_price
+        can_sell = pos.closeable_amount > 0
+
+        if not can_sell:
+            continue
+
+        if now <= cost * 0.95:
+            order_target_value(code, 0)
+            log.info(f'【-5%止损】卖出：{get_security_info(code).display_name}')
+            continue
+
+        if t == '11:28:00' and now > cost and now < curr_data[code].high_limit:
+            order_target_value(code, 0)
+            log.info(f'【止盈】卖出：{get_security_info(code).display_name}')
+            continue
+
+        if t == '14:50:00' and now < curr_data[code].high_limit:
+            order_target_value(code, 0)
+            log.info(f'【清仓】卖出：{get_security_info(code).display_name}')

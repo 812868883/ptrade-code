@@ -1,0 +1,477 @@
+# 4号低开低吸验证版
+# 基于本地交割单证据库反推得到的高置信规则：
+# 1. 主板股票池
+# 2. 买入前 5 个交易日内存在涨停记忆
+# 3. 昨日优先要求回调
+# 4. 今日集合竞价/开盘轻微低开优先
+# 5. 每天只买 1 只
+# 6. 盘中约 +5% 止盈
+# 7. 14:55 左右统一止损
+
+import numpy as np
+
+
+def initialize(context):
+    try:
+        set_benchmark("000300.SS")
+    except Exception:
+        pass
+
+    g.buy_stock_count_per_day = 1
+    g.tp_ratio = 0.05
+    g.sl_ratio = -0.05
+    g.max_hold_days = 7
+
+    # 低开区间来自交割单验证结果：
+    # 主分布在 -3% 到 0%，但存在少量 -6% 以下仍然成功的样本，因此不硬过滤过深低开，只做重罚分
+    g.min_open_gap = -0.09
+    g.max_open_gap = 0.003
+    g.target_open_gap = -0.012
+    g.require_pullback = True
+    g.allow_strong_exception = False
+    g.strong_exception_max_gap = 0.01
+    g.strong_exception_limit_days = 1
+    g.prefer_large_cap = True
+    g.large_cap_score_weight = 1.20
+
+    # 主板池不追求极致缩窄，先保留较大范围用于验证
+    g.max_main_board_pool = 1500
+
+    g.hold_days = {}
+    g.stock_list = []
+    g.today_candidates = []
+    g.today_bought_count = 0
+
+    if not is_trade():
+        set_backtest()
+
+    buy_time = "09:27" if is_trade() else "09:30"
+    run_daily(context, execute_buy, time=buy_time)
+    run_daily(context, check_stop_loss_and_timeout, time="14:55")
+
+    log.info("=" * 60)
+    log.info("4号低开低吸验证版初始化完成")
+    log.info("买入时间=%s, 止盈=%.1f%%, 止损=%.1f%%", buy_time, g.tp_ratio * 100, g.sl_ratio * 100)
+    log.info("=" * 60)
+
+
+def set_backtest():
+    set_limit_mode("UNLIMITED")
+    set_commission(commission_ratio=0.0003)
+    set_slippage(slippage=0.001)
+
+
+def before_trading_start(context, data):
+    g.stock_list = build_main_board_pool(context)
+    g.today_candidates = []
+    g.today_bought_count = 0
+
+    positions = context.portfolio.positions
+    for stock in list(g.hold_days.keys()):
+        if stock not in positions or positions[stock].total_amount == 0:
+            del g.hold_days[stock]
+        else:
+            g.hold_days[stock] += 1
+
+    if g.stock_list:
+        try:
+            set_universe(g.stock_list)
+        except Exception:
+            pass
+
+    log.info("[盘前] 主板候选池数量：%d", len(g.stock_list))
+
+
+def handle_data(context, data):
+    check_take_profit(context, data)
+
+
+def execute_buy(context, data=None):
+    if g.today_bought_count >= g.buy_stock_count_per_day:
+        return
+
+    current_positions = [
+        stock for stock, pos in context.portfolio.positions.items()
+        if pos.total_amount > 0
+    ]
+    if current_positions:
+        log.info("[买入跳过] 当前已有持仓：%s", current_positions)
+        return
+
+    candidates = get_limit_up_pullback_candidates(context, g.stock_list)
+    g.today_candidates = candidates
+
+    if not candidates:
+        log.info("[选股结果] 今日无符合条件标的")
+        return
+
+    candidate_log = []
+    for item in candidates[:5]:
+        candidate_log.append(
+            (
+                item["stock"],
+                "gap=%.2f%%" % (item["open_gap"] * 100),
+                "yret=%.2f%%" % (item["y_ret"] * 100),
+                "pullback=%s" % str(bool(item["is_pullback"])),
+                "limit=%s" % item["latest_limit_date"],
+                "float=%.2f" % (item.get("float_value", 0) / 100000000 if item.get("float_value", 0) else 0),
+                "score=%.3f" % item["score"],
+            )
+        )
+    log.info("[选股结果] 候选数量：%d，前几名：%s", len(candidates), candidate_log)
+
+    best = candidates[0]
+    cash = context.portfolio.cash
+    buy_cash = cash * 0.98
+    if buy_cash < 2000:
+        log.info("[买入跳过] 可用资金不足：%.2f", buy_cash)
+        return
+
+    log.info(
+        "[核心交易行为] 最终买入：%s，开盘缺口=%.2f%%，昨日回调=%s，最近涨停日=%s",
+        best["stock"],
+        best["open_gap"] * 100,
+        str(bool(best["is_pullback"])),
+        best["latest_limit_date"],
+    )
+    order_value(best["stock"], buy_cash)
+    g.hold_days[best["stock"]] = 0
+    g.today_bought_count += 1
+
+
+def check_take_profit(context, data):
+    positions = context.portfolio.positions
+    for stock in list(positions.keys()):
+        pos = positions[stock]
+        if pos.total_amount <= 0 or pos.closeable_amount <= 0:
+            continue
+
+        cost = pos.cost_basis
+        curr_price = 0
+        try:
+            curr_price = data[stock].price
+        except Exception:
+            curr_price = get_last_price(stock)
+
+        if cost <= 0 or curr_price <= 0:
+            continue
+
+        ret = curr_price / cost - 1
+        if ret >= g.tp_ratio:
+            log.info("[盘中止盈] %s 收益率：%.2f%%", stock, ret * 100)
+            order_target_value(stock, 0)
+            if stock in g.hold_days:
+                del g.hold_days[stock]
+
+
+def check_stop_loss_and_timeout(context, data=None):
+    positions = context.portfolio.positions
+    for stock in list(positions.keys()):
+        pos = positions[stock]
+        if pos.total_amount <= 0 or pos.closeable_amount <= 0:
+            continue
+
+        cost = pos.cost_basis
+        curr_price = get_last_price(stock)
+        if cost <= 0 or curr_price <= 0:
+            continue
+
+        ret = curr_price / cost - 1
+        if ret <= g.sl_ratio:
+            log.info("[尾盘止损] %s 收益率：%.2f%%", stock, ret * 100)
+            order_target_value(stock, 0)
+            if stock in g.hold_days:
+                del g.hold_days[stock]
+        elif stock in g.hold_days and g.hold_days[stock] >= g.max_hold_days:
+            log.info("[超时平仓] %s 持仓天数：%d", stock, g.hold_days[stock])
+            order_target_value(stock, 0)
+            if stock in g.hold_days:
+                del g.hold_days[stock]
+
+
+def build_main_board_pool(context):
+    stocks = []
+    try:
+        stocks = get_all_securities("stock").index.tolist()
+    except Exception:
+        pass
+
+    if not stocks:
+        return []
+
+    main_board = []
+    for stock in stocks:
+        code = normalize_code(stock)
+        if not code:
+            continue
+        if code.startswith(("60", "000", "001", "002", "003", "605", "603")):
+            if not code.startswith(("300", "301", "688", "8")):
+                main_board.append(stock)
+
+    main_board = list(set(main_board))
+    if not main_board:
+        return []
+
+    try:
+        df = get_fundamentals(
+            main_board,
+            "valuation",
+            fields=["float_value"],
+            date=context.previous_date,
+        )
+        if df is not None and not df.empty and "float_value" in df.columns:
+            df = df.sort_values(by="float_value", ascending=False)
+            main_board = df.head(g.max_main_board_pool).index.tolist()
+    except Exception as e:
+        log.warning("[盘前] 获取流通市值失败，改用全主板池：%s", str(e))
+
+    try:
+        main_board = filter_stock_by_status(
+            main_board,
+            filter_type=["ST", "HALT", "DELISTING"],
+            query_date=None,
+        )
+    except Exception:
+        pass
+
+    return main_board
+
+
+def get_limit_up_pullback_candidates(context, stock_list):
+    if not stock_list:
+        return []
+
+    history = get_daily_history(stock_list)
+    if not history:
+        return []
+
+    candidates = []
+    reject_stats = {
+        "pattern_fail": 0,
+        "pullback_fail": 0,
+        "open_fail": 0,
+        "exception_fail": 0,
+    }
+    for stock in stock_list:
+        info = analyze_stock_pattern(stock, history)
+        if info is None:
+            reject_stats["pattern_fail"] += 1
+            continue
+
+        open_price = get_open_reference_price(stock)
+        if open_price <= 0:
+            reject_stats["open_fail"] += 1
+            continue
+
+        open_gap = open_price / info["y_close"] - 1
+        if open_gap < g.min_open_gap or open_gap > g.max_open_gap:
+            if not (
+                g.allow_strong_exception
+                and info["days_since_limit"] <= g.strong_exception_limit_days
+                and open_gap <= g.strong_exception_max_gap
+            ):
+                reject_stats["open_fail"] += 1
+                continue
+
+        if g.require_pullback and not info["is_pullback"]:
+            if not g.allow_strong_exception:
+                reject_stats["pullback_fail"] += 1
+                continue
+            if (
+                open_gap > g.strong_exception_max_gap
+                or info["days_since_limit"] > g.strong_exception_limit_days
+            ):
+                reject_stats["exception_fail"] += 1
+                continue
+
+        # 评分逻辑尽量贴近交割单主分布：
+        # 1. 低开最好接近历史中位数 -1.2%
+        # 2. 最近涨停越近越好
+        # 3. 昨天要回调，但回撤不要极端过深
+        gap_penalty = abs(open_gap - g.target_open_gap)
+        limit_recency_penalty = info["days_since_limit"] * 0.60
+        pullback_penalty = abs(info["y_ret"]) * 8
+        deep_gap_penalty = max(0, abs(open_gap) - 0.03) * 20
+        positive_gap_penalty = max(0, open_gap) * 40
+        body_penalty = max(0, abs(info["y_body_ret"]) - 0.08) * 20
+        score = (
+            gap_penalty * 100
+            + limit_recency_penalty
+            + pullback_penalty
+            + deep_gap_penalty
+            + positive_gap_penalty
+            + body_penalty
+        )
+
+        info["stock"] = stock
+        info["open_price"] = open_price
+        info["open_gap"] = open_gap
+        info["score"] = score
+        candidates.append(info)
+
+    apply_large_cap_preference(context, candidates)
+    candidates.sort(key=lambda x: (x["score"], x["open_gap"]))
+    log.info(
+        "[盘前筛选统计] 总池=%d, 形态失败=%d, 回调失败=%d, 开盘失败=%d, 例外失败=%d, 最终候选=%d",
+        len(stock_list),
+        reject_stats["pattern_fail"],
+        reject_stats["pullback_fail"],
+        reject_stats["open_fail"],
+        reject_stats["exception_fail"],
+        len(candidates),
+    )
+    return candidates
+
+
+def apply_large_cap_preference(context, candidates):
+    if not g.prefer_large_cap or not candidates:
+        return
+
+    codes = [item["stock"] for item in candidates]
+    cap_map = {}
+    try:
+        df = get_fundamentals(
+            codes,
+            "valuation",
+            fields=["float_value"],
+            date=context.previous_date,
+        )
+        if df is not None and not df.empty and "float_value" in df.columns:
+            df = df.sort_values(by="float_value", ascending=False)
+            total = max(len(df) - 1, 1)
+            for idx, (code, row) in enumerate(df.iterrows()):
+                cap_penalty = (idx / float(total)) * g.large_cap_score_weight
+                cap_map[code] = {
+                    "float_value": float(row["float_value"]) if row["float_value"] == row["float_value"] else 0,
+                    "cap_penalty": cap_penalty,
+                }
+    except Exception as e:
+        log.warning("[市值因子失败] %s", str(e))
+        return
+
+    for item in candidates:
+        code = item["stock"]
+        if code in cap_map:
+            item["float_value"] = cap_map[code]["float_value"]
+            item["score"] += cap_map[code]["cap_penalty"]
+        else:
+            item["float_value"] = 0
+
+
+def get_daily_history(stock_list):
+    try:
+        history = get_history(
+            8,
+            "1d",
+            ["open", "close"],
+            stock_list,
+            fq="pre",
+            include=False,
+            is_dict=True,
+        )
+    except Exception as e:
+        log.error("[历史数据失败] %s", str(e))
+        return None
+
+    return history
+
+
+def analyze_stock_pattern(stock, history):
+    try:
+        if "close" in history and "open" in history:
+            df_close = history["close"]
+            df_open = history["open"]
+            if stock not in df_close.columns or stock not in df_open.columns:
+                return None
+            closes = df_close[stock].values
+            opens = df_open[stock].values
+        else:
+            if stock not in history:
+                return None
+            stock_df = history[stock]
+            closes = stock_df["close"].values
+            opens = stock_df["open"].values
+    except Exception:
+        return None
+
+    valid_idx = ~np.isnan(closes)
+    if np.sum(valid_idx) < 7:
+        return None
+
+    closes = closes[valid_idx]
+    opens = opens[valid_idx]
+
+    y_close = float(closes[-1])
+    y_open = float(opens[-1])
+    prev_close = float(closes[-2])
+    if y_close <= 0 or prev_close <= 0:
+        return None
+
+    y_ret = y_close / prev_close - 1
+    y_body_ret = y_close / y_open - 1 if y_open > 0 else 0
+    is_pullback = (y_close < y_open) or (y_close < prev_close)
+
+    latest_limit_idx = None
+    for i in range(-6, -1):
+        base = float(closes[i - 1])
+        curr = float(closes[i])
+        if base <= 0:
+            continue
+        daily_ret = curr / base - 1
+        if daily_ret >= 0.095:
+            latest_limit_idx = i
+
+    if latest_limit_idx is None:
+        return None
+
+    days_since_limit = abs(latest_limit_idx + 1)
+    return {
+        "y_close": y_close,
+        "y_open": y_open,
+        "prev_close": prev_close,
+        "y_ret": y_ret,
+        "y_body_ret": y_body_ret,
+        "is_pullback": is_pullback,
+        "latest_limit_date": "最近%d天内" % days_since_limit,
+        "days_since_limit": days_since_limit,
+    }
+
+
+def get_open_reference_price(stock):
+    price = 0
+    try:
+        if is_trade():
+            snap = get_snapshot(stock)
+            if snap and stock in snap:
+                info = snap[stock]
+                price = info.get("open_px", 0) or info.get("last_px", 0)
+        else:
+            h = get_history(1, "1d", "open", [stock], fq="pre", include=True, is_dict=False)
+            if h is not None and len(h) > 0:
+                price = float(h.iloc[-1, 0])
+    except Exception:
+        price = 0
+    return float(price) if price else 0
+
+
+def get_last_price(stock):
+    price = 0
+    try:
+        if is_trade():
+            snap = get_snapshot(stock)
+            if snap and stock in snap:
+                price = snap[stock].get("last_px", 0)
+        else:
+            h = get_history(1, "1d", "close", [stock], fq="pre", include=True, is_dict=False)
+            if h is not None and len(h) > 0:
+                price = float(h.iloc[-1, 0])
+    except Exception:
+        price = 0
+    return float(price) if price else 0
+
+
+def normalize_code(stock):
+    if stock is None:
+        return ""
+    text = str(stock)
+    return text.split(".")[0]

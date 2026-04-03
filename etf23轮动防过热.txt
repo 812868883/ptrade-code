@@ -1,0 +1,1136 @@
+import json
+
+# ═══════════════════════════════════════════════════════════════
+# ETF尾盘轮动策略（23半小时版）- PTrade
+# ─────────────────────────────────────────────────────────────
+# 核心逻辑：
+#   - 每分钟扫描跌幅，触发阈值立即卖出
+#   - 14:50 买入（继续追买直到满额）
+#   - 10:00/13:30 打印排行榜
+#   - 15:05 结算日志
+#
+# 时间表：
+#   10:00  打印盘中前锋榜
+#   13:30  打印盘中前锋榜
+#   14:50  买入新标的（继续追买直到满额）
+#   15:05  收盘结算日志
+#   每分钟(09:31-14:59) 扫描跌幅，触发则偷袭卖出
+# ═══════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────────────────────
+
+def _get_file_path(filename):
+    """获取研究目录路径"""
+    try:
+        return get_research_path() + '/' + filename
+    except Exception:
+        return filename
+
+
+def _load_json(filename):
+    """读取JSON文件"""
+    try:
+        path = _get_file_path(filename)
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.loads(f.read()) or {}
+    except Exception as e:
+        log.warning('[文件读取失败] %s | 原因: %s' % (filename, str(e)))
+        return None
+
+
+def _save_json(filename, data):
+    """写入JSON文件（先写临时文件再rename，防崩溃导致文件损坏）"""
+    try:
+        import os
+        path = _get_file_path(filename)
+        tmp_path = path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2))
+        # 原子替换：rename 是操作系统级原子操作
+        if os.path.exists(path):
+            os.remove(path)
+        os.rename(tmp_path, path)
+    except Exception as e:
+        log.error('[硬盘写入失败] %s: %s' % (filename, str(e)))
+
+
+def _save_state(data):
+    """写入持久化状态"""
+    _save_json('etf23_halfhour_state.json', data)
+
+
+def _load_state():
+    """读取持久化状态"""
+    data = _load_json('etf23_halfhour_state.json')
+    return data if data else {}
+
+
+def _create_default_config():
+    """创建默认配置文件"""
+    config = {
+        "单次投入金额": 150000,
+        "移动止损回撤比(%)": 4.0,
+        "买入准入均线要求(%)": 1.5,
+        "买入动量下限(%)": -2.5,
+        "当日跌幅卖出阈值(%)": -5.0,
+        "主动换仓动量领先阈值(%)": 3.0,
+        "买入防过热暴涨线(%)": 5.0
+    }
+    _save_json('etf23_halfhour_config.json', config)
+    log.info('[配置] 已自动创建默认配置文件 etf23_halfhour_config.json')
+    return config
+
+
+def _load_config():
+    """读取配置（不存在则创建默认，缺失则自动补充）"""
+    path = _get_file_path('etf23_halfhour_config.json')
+    log.info('[配置] 尝试读取: %s' % path)
+    data = _load_json('etf23_halfhour_config.json')
+    if data is None:
+        log.warning('[配置] 文件读取失败，使用程序默认值创建新配置')
+        return _create_default_config()
+
+    log.info('[配置] 文件读取成功，来源: %s' % path)
+
+    defaults = {
+        "单次投入金额": 150000,
+        "移动止损回撤比(%)": 4.0,
+        "买入准入均线要求(%)": 1.5,
+        "买入动量下限(%)": -2.5,
+        "当日跌幅卖出阈值(%)": -5.0,
+        "主动换仓动量领先阈值(%)": 3.0,
+        "买入防过热暴涨线(%)": 5.0
+    }
+    
+    updated = False
+    for k, v in defaults.items():
+        if k not in data:
+            data[k] = v
+            updated = True
+            log.info('[配置] 自动补充缺失配置项: %s = %s' % (k, str(v)))
+            
+    if updated:
+        _save_json('etf23_halfhour_config.json', data)
+        log.info('[配置] 配置文件已自动更新合并')
+        
+    return data
+
+
+def _same_security(code_a, code_b):
+    """判断两个代码是否同一标的（比较前6位）"""
+    if not code_a or not code_b:
+        return False
+    return str(code_a)[:6] == str(code_b)[:6]
+
+
+def _extract_symbol(order_obj):
+    """从Order对象提取symbol"""
+    symbol = getattr(order_obj, 'symbol', '')
+    if symbol:
+        return str(symbol)
+    try:
+        return str(order_obj.get('symbol', ''))
+    except Exception:
+        return ''
+
+
+def _extract_amount(order_obj):
+    """从Order对象提取amount"""
+    amount = getattr(order_obj, 'amount', None)
+    if amount is not None:
+        return amount
+    try:
+        return order_obj.get('amount')
+    except Exception:
+        return 0
+
+
+def _is_strategy_security(code):
+    """判断code是否属于本策略ETF池"""
+    if not code:
+        return False
+    for pool_code in getattr(g, 'codes', []):
+        if _same_security(code, pool_code):
+            return True
+    return False
+
+
+def _get_strategy_open_orders(security_code=None):
+    """获取本策略相关的未完成委托"""
+    result = []
+    try:
+        open_orders = get_open_orders()
+        if not open_orders:
+            return result
+        for pending in open_orders:
+            symbol = _extract_symbol(pending)
+            if not _is_strategy_security(symbol):
+                continue
+            if security_code and not _same_security(symbol, security_code):
+                continue
+            result.append(pending)
+    except Exception as e:
+        log.warning('[查询未完成委托失败] %s' % str(e))
+    return result
+
+
+def _refresh_pending_order():
+    """根据当前挂单刷新待成交状态"""
+    open_orders = _get_strategy_open_orders()
+    if not open_orders:
+        g.pending_order = {'code': None, 'side': None, 'order_id': None}
+        return
+
+    pending = open_orders[0]
+    symbol = _extract_symbol(pending)
+    amount = _extract_amount(pending)
+    side = 'sell' if float(amount) < 0 else 'buy'
+    g.pending_order = {'code': symbol, 'side': side, 'order_id': getattr(pending, 'id', None)}
+
+
+def _cancel_open_orders(security_code=None):
+    """撤销本策略的未完成委托"""
+    cancelled = 0
+    try:
+        open_orders = _get_strategy_open_orders(security_code)
+        if not open_orders:
+            return cancelled
+        for pending in open_orders:
+            try:
+                cancel_order(pending)
+                cancelled += 1
+                log.info('[撤单] 已撤销: %s' % _extract_symbol(pending))
+            except Exception as e:
+                log.warning('[撤单失败] %s' % str(e))
+        _refresh_pending_order()
+    except Exception as e:
+        log.warning('[撤单流程异常] %s' % str(e))
+    return cancelled
+
+
+def _get_limit_flag(code):
+    """检查涨跌停状态"""
+    try:
+        result = check_limit(code)
+        if isinstance(result, dict):
+            if code in result:
+                return result.get(code, 0)
+            code6 = code[:6]
+            for k in result:
+                if k[:6] == code6:
+                    return result.get(k, 0)
+            return 0
+        return result
+    except Exception:
+        return 0
+
+
+def _normalize_payload(payload):
+    """兼容主推回调可能是单个对象或列表"""
+    if not payload:
+        return []
+    if isinstance(payload, (list, tuple)):
+        return list(payload)
+    return [payload]
+
+
+def _get_live_price(code, direction='buy'):
+    """获取实时快照价格（ETF 3位小数）"""
+    try:
+        snap = get_snapshot(code)
+        if not snap:
+            return None
+        info = snap.get(code)
+        if info is None:
+            for k in snap:
+                if k[:6] == code[:6]:
+                    info = snap[k]
+                    break
+        if not info:
+            return None
+        last_px = float(info.get('last_px', 0))
+        if last_px <= 0:
+            return None
+        # ETF 3位小数，买入上浮0.2%，卖出下浮0.2%
+        if direction == 'buy':
+            return round(last_px * 1.002, 3)
+        else:
+            return round(last_px * 0.998, 3)
+    except Exception:
+        return None
+
+
+def _get_current_price(context, code):
+    """获取当前真实价格（不带买卖方向偏移，用于风控判断和排名计算）"""
+    if is_trade():
+        # 直接取快照 last_px，不乘方向系数，确保止损/涨跌幅判断准确
+        try:
+            snap = get_snapshot(code)
+            if not snap:
+                return None
+            info = snap.get(code)
+            if info is None:
+                for k in snap:
+                    if k[:6] == code[:6]:
+                        info = snap[k]
+                        break
+            if not info:
+                return None
+            last_px = float(info.get('last_px', 0))
+            return last_px if last_px > 0 else None
+        except Exception:
+            return None
+    else:
+        try:
+            raw = get_history(2, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+            if raw:
+                cl = _extract_close_list(raw, code)
+                if cl and len(cl) > 0:
+                    return float(cl[-1])
+        except Exception:
+            pass
+        return None
+
+
+def _extract_close_list(raw_dict, code):
+    """从get_history返回提取收盘价列表"""
+    arr = None
+    if code in raw_dict:
+        arr = raw_dict[code]
+    else:
+        # 尝试不同尾缀
+        for old, new in [('.SS', '.XSHG'), ('.SZ', '.XSHE'),
+                         ('.XSHG', '.SS'), ('.XSHE', '.SZ')]:
+            alt = code.replace(old, new)
+            if alt in raw_dict:
+                arr = raw_dict[alt]
+                break
+        if arr is None:
+            code6 = code[:6]
+            for k in raw_dict:
+                if k[:6] == code6:
+                    arr = raw_dict[k]
+                    break
+
+    if arr is None or len(arr) == 0:
+        return None
+
+    res = []
+    for row in arr:
+        try:
+            if isinstance(row, (int, float)):
+                res.append(float(row))
+            elif hasattr(row, '__len__'):
+                if len(row) >= 5:
+                    res.append(float(row[4]))
+                elif len(row) > 0:
+                    res.append(float(row[-1]))
+        except Exception:
+            pass
+    return res if res else None
+
+
+# ─────────────────────────────────────────────────────────────
+# 状态管理
+# ─────────────────────────────────────────────────────────────
+
+def _sync_holding_state(context):
+    """以账户真实持仓为准刷新内存状态"""
+    positions = context.portfolio.positions
+    actual = None
+    for code in positions:
+        if positions[code].amount > 0 and _is_strategy_security(code):
+            actual = code
+            break
+    g.current_holding = actual
+    if actual is None:
+        # 有挂单的买单尚未成交，不能清零最高价（回测中持仓可能有延迟）
+        if g.pending_order.get('side') == 'buy':
+            return actual  # 等待成交，保持现有最高价不动
+        g.highest_price = 0.0
+        # 卖单已成交、持仓清零，同步清除挂单状态
+        g.pending_order = {'code': None, 'side': None, 'order_id': None}
+    return actual
+
+
+def _find_other_strategy_holdings(context):
+    """找出账户中其他策略（非本ETF池）持有的股票"""
+    other = []
+    positions = context.portfolio.positions
+    for code in positions:
+        if positions[code].amount > 0 and not _is_strategy_security(code):
+            other.append(code)
+    return other
+
+
+def _update_highest_price(code, price):
+    """更新持仓最高价并持久化"""
+    if price <= 0:
+        return
+    if price > g.highest_price:
+        g.highest_price = price
+        state = _load_state()
+        state['highest_price'] = price
+        state['holding_code'] = code
+        state['sold_today'] = list(g.sold_today_codes)
+        # ── 可读备注字段（仅供人工查看，代码读取不依赖这两个字段）──
+        state['_holding_name'] = g.code_name.get(code, code)
+        try:
+            import datetime
+            state['_highest_price_time'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            pass
+        _save_state(state)
+        log.info('[新高记录] %s 当前最高价: %.3f' % (g.code_name.get(code, code), price))
+
+
+def _get_today_change(context, code, current_price=None):
+    """计算标的今日涨跌幅"""
+    if current_price is None:
+        current_price = _get_current_price(context, code)
+    if current_price is None or current_price <= 0:
+        return 0.0
+
+    preclose = 0.0
+    try:
+        if is_trade():
+            snap = get_snapshot(code)
+            if snap:
+                info = snap.get(code)
+                if info is None:
+                    for k in snap:
+                        if k[:6] == code[:6]:
+                            info = snap[k]
+                            break
+                if info:
+                    preclose = float(info.get('preclose_px', 0))
+        else:
+            raw = get_history(2, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+            if raw:
+                cl = _extract_close_list(raw, code)
+                if cl and len(cl) >= 2:
+                    preclose = float(cl[-2])
+    except Exception:
+        pass
+
+    if preclose > 0:
+        return (current_price / preclose - 1.0) * 100.0
+    return 0.0
+
+
+# ─────────────────────────────────────────────────────────────
+# 排名计算
+# ─────────────────────────────────────────────────────────────
+
+def calc_realtime_ranking(context):
+    """计算ETF实时20日动量排名"""
+    rankings = []
+    need_bars = g.ranking_period + 5
+
+    for code in g.tradable_codes:
+        try:
+            # 回测用is_dict=False（返回DataFrame），实盘也兼容
+            raw = get_history(need_bars, '1d', 'close', code, fq='pre', include=False, is_dict=True)
+            if raw is None:
+                continue
+
+            cl = _extract_close_list(raw, code)
+            if cl is None or len(cl) < g.ranking_period:
+                continue
+
+            today_price = _get_current_price(context, code)
+            if today_price is None or today_price <= 0:
+                today_price = float(cl[-1])
+
+            if cl[-g.ranking_period] <= 0:
+                continue
+            c20 = (today_price / cl[-g.ranking_period] - 1.0) * 100.0
+
+            if len(cl) >= g.buy_period and cl[-g.buy_period] > 0:
+                c13 = (today_price / cl[-g.buy_period] - 1.0) * 100.0
+            else:
+                c13 = 0.0
+
+            rankings.append({
+                'code': code,
+                'name': g.code_name.get(code, code),
+                'change20': c20,
+                'change13': c13,
+                'price': today_price,
+            })
+        except Exception as e:
+            log.error('[排名异常] %s: %s' % (code, str(e)))
+
+    rankings.sort(key=lambda x: x['change20'], reverse=True)
+    return rankings
+
+
+# ─────────────────────────────────────────────────────────────
+# 卖出执行
+# ─────────────────────────────────────────────────────────────
+
+def _do_sell(context, code, reason):
+    """执行卖出"""
+    log.warning('[卖出] %s | %s' % (g.code_name.get(code, code), reason))
+
+    positions = context.portfolio.positions
+    actual_code = None
+    for c in positions:
+        if _same_security(c, code) and positions[c].amount > 0:
+            actual_code = c
+            break
+
+    if actual_code is None:
+        log.info('[卖出] 账户无持仓，跳过')
+        g.current_holding = None
+        g.highest_price = 0.0
+        return
+
+    sell_amount = int(float(positions[actual_code].enable_amount))  # 兼容不同柜台返回str/float/int
+    if sell_amount <= 0:
+        log.info('[卖出] 可卖数量为0，跳过（T+1当日买入无法卖出）')
+        return  # 不清空状态，持仓仍在账户，明天继续监控
+
+    # 检查涨跌停
+    try:
+        limit_flag = _get_limit_flag(actual_code)
+        if limit_flag == -1:
+            log.warning('[卖出] %s 跌停板，无法卖出' % code)
+            return
+    except Exception:
+        pass
+
+    # 检查是否有未完成卖单（回测/实盘均检查，防止每分钟重复下单）
+    pending = g.pending_order
+    if pending.get('side') == 'sell' and _same_security(pending.get('code'), actual_code):
+        log.info('[卖出] 已有未完成卖单，等待')
+        return
+
+    if is_trade():
+        sell_price = _get_live_price(actual_code, direction='sell')
+        if not sell_price:
+            # 快照失败，用get_history再取一次当前价，下浮0.5%确保能成交
+            sell_price = _get_current_price(context, actual_code)
+            if sell_price and sell_price > 0:
+                sell_price = round(sell_price * 0.995, 3)
+                log.warning('[卖出] 快照失败，用历史价兜底: %.3f' % sell_price)
+        if not sell_price or sell_price <= 0:
+            log.error('[卖出] 无法获取价格，本次卖出取消，下一分钟重试')
+            return
+        oid = order(actual_code, -sell_amount, limit_price=sell_price)
+    else:
+        oid = order(actual_code, -sell_amount)
+
+    if oid is not None:
+        log.info('[卖出委托] 已提交，等待成交确认')
+        # 回测/实盘均记录挂单，防止下一分钟重复触发
+        g.pending_order = {'code': actual_code, 'side': 'sell', 'order_id': oid}
+        # 立刻标记今日已卖出，防止回测中 on_trade_response 不执行导致当天重买
+        code6 = actual_code[:6]
+        g.sold_today_codes.add(code6)
+    else:
+        log.error('[卖出] 委托失败')
+
+
+# ─────────────────────────────────────────────────────────────
+# 买入执行（支持部分成交继续追买）
+# ─────────────────────────────────────────────────────────────
+
+def _do_buy(context, code, name, target_shares=None):
+    """执行买入（target_shares=None表示新目标，-1表示继续追剩余）"""
+    log.info('[买入] %s(%s) 目标股数: %s' % (code, name, target_shares if target_shares else '新单'))
+
+    # 检查涨跌停
+    try:
+        limit_flag = _get_limit_flag(code)
+        if limit_flag >= 1:  # 1=涨停，2=触板涨停（有卖盘但价格已封顶）均放弃买入
+            log.warning('[买入] %s 涨停/触板涨停(flag=%d)，放弃' % (name, limit_flag))
+            return
+    except Exception:
+        pass
+
+    # 检查是否有未完成买单（回测/实盘均检查，换仓路径也防重复下单）
+    if target_shares is None:  # 新目标
+        pending = g.pending_order
+        if pending.get('side') == 'buy' and _same_security(pending.get('code'), code):
+            log.info('[买入] 已有未完成买单，等待')
+            return
+
+    if is_trade():
+        buy_price = _get_live_price(code, direction='buy')
+    else:
+        # 回测模式：用get_history获取当前价（get_snapshot不支持回测）
+        buy_price = _get_current_price(context, code)
+        if buy_price and buy_price > 0:
+            buy_price = round(buy_price * 1.002, 3)  # 买入上浮0.2%
+    if not buy_price or buy_price <= 0:
+        log.error('[买入] 无法获取有效价格')
+        return
+
+    # 计算买入股数
+    if target_shares is None:  # 新目标
+        cash = context.portfolio.cash
+        target_cash = min(cash, g.max_strategy_capital)
+        available = target_cash * 0.98
+        shares = int(available / buy_price)
+        shares = (shares // 100) * 100  # 100股整数
+        if shares <= 0:
+            log.info('[买入] 资金不足')
+            return
+        g.target_buy_shares = shares  # 记录目标股数
+        g.buy_retry_count = 0  # 重试计数清零
+    else:
+        shares = target_shares  # 继续追买
+
+    log.info('[买入] 报价%.3f 数量%d' % (buy_price, shares))
+
+    oid = order(code, shares, limit_price=buy_price)
+    if oid is not None:
+        log.info('[买入委托] 已提交，等待成交确认')
+        # 回测/实盘均记录挂单，防止持仓空窗期 _sync_holding_state 清零最高价
+        g.pending_order = {'code': code, 'side': 'buy', 'order_id': oid}
+        if not is_trade():
+            # 回测中 on_trade_response 不执行，买入报价即为第一个已知高点
+            # 必须在这里初始化，否则下一分钟价格若低于买入价，最高价会被低估
+            if buy_price > g.highest_price:
+                g.highest_price = buy_price
+                state = _load_state()
+                state['highest_price'] = buy_price
+                state['holding_code'] = code
+                state['sold_today'] = list(g.sold_today_codes)
+                _save_state(state)
+                log.info('[买入] 回测初始化最高价: %.3f' % buy_price)
+    else:
+        log.error('[买入] 委托失败')
+
+
+# ─────────────────────────────────────────────────────────────
+# 每分钟扫描（卖出逻辑）
+# ─────────────────────────────────────────────────────────────
+
+def _minute_risk_scan(context):
+    """每分钟扫描：检查跌幅是否触发卖出"""
+    # 先同步真实持仓（回测中委托可能已在上一bar成交）
+    _sync_holding_state(context)
+
+    # 主动换仓：如果卖单已成交且有换仓目标，立刻买入
+    if g.current_holding is None and g.switch_target:
+        target = g.switch_target
+        g.switch_target = None
+        # 今日已卖出的标的禁止买回
+        if target['code'][:6] in g.sold_today_codes:
+            log.warning('[换仓买入] %s 今日已卖出，取消换仓买入' % target['name'])
+            return
+        log.info('[换仓买入] 卖单已成交，立刻买入 %s' % target['name'])
+        _do_buy(context, target['code'], target['name'])
+        return
+
+    if g.current_holding is None:
+        return
+
+    code = g.current_holding
+
+    # 如果该标的已有未完成卖单，静默等待，不要重复打驚告
+    pending = g.pending_order
+    if pending.get('side') == 'sell' and _same_security(pending.get('code'), code):
+        return
+
+    # 获取实时价格
+    current_price = _get_current_price(context, code)
+    if current_price is None or current_price <= 0:
+        return
+
+    # 更新最高价
+    _update_highest_price(code, current_price)
+
+    # 计算跌幅
+    if g.highest_price > 0:
+        drawdown = (g.highest_price - current_price) / g.highest_price * 100.0
+    else:
+        drawdown = 0.0
+
+    # 获取昨收计算今日跌幅
+    preclose = 0.0
+    try:
+        if is_trade():
+            snap = get_snapshot(code)
+            if snap:
+                info = snap.get(code)
+                if info is None:
+                    for k in snap:
+                        if k[:6] == code[:6]:
+                            info = snap[k]
+                            break
+                if info:
+                    preclose = float(info.get('preclose_px', 0))
+        else:
+            # 回测模式：用get_history获取昨日收盘价
+            raw = get_history(2, '1d', 'close', code, fq='pre', include=True, is_dict=True)
+            if raw:
+                cl = _extract_close_list(raw, code)
+                if cl and len(cl) >= 2:
+                    preclose = float(cl[-2])  # 昨收是倒数第二根K线
+    except Exception:
+        pass
+
+    change_today = 0.0
+    if preclose > 0:
+        change_today = (current_price / preclose - 1.0) * 100.0
+
+    # 检查是否触发卖出
+    triggered = False
+    reason = ''
+
+    # 条件1：移动止损回撤
+    if drawdown >= g.trailing_stop_pct:
+        triggered = True
+        reason = '移动止损(回撤%.2f%%)' % drawdown
+
+    # 条件2：今日跌幅过大
+    if change_today <= g.sell_threshold:
+        triggered = True
+        reason = '当日跌幅(%.1f%% <= %.1f%%)' % (change_today, g.sell_threshold)
+
+    if triggered:
+        log.warning('[偷袭卖出] %s 当前价%.3f 最高%.3f 回撤%.2f%% 今日%.1f%% | 原因: %s'
+                    % (g.code_name.get(code, code), current_price, g.highest_price,
+                       drawdown, change_today, reason))
+        _do_sell(context, code, reason)
+
+
+# ─────────────────────────────────────────────────────────────
+# 定时任务
+# ─────────────────────────────────────────────────────────────
+
+def _log_rankings(context, time_label):
+    """打印排行榜"""
+    rankings = calc_realtime_ranking(context)
+    if not rankings:
+        log.warning('[%s 排行榜] 无有效数据' % time_label)
+        return rankings
+
+    log.info('[%s 排行榜] 资金流入前锋榜 Top5:' % time_label)
+    for i, r in enumerate(rankings[:5]):
+        marker = ' [🔥持仓]' if (g.current_holding and _same_security(r['code'], g.current_holding)) else ''
+        log.info('  No.%d %s | 20日%.1f%% 13日%.1f%% %s'
+                 % (i + 1, r['name'], r['change20'], r['change13'], marker))
+
+    return rankings
+
+
+def _log_rankings_1000(context):
+    """10:00 定时打印排行榜（具名函数，避免lambda序列化风险）"""
+    _log_rankings(context, '10:00')
+
+
+def _log_rankings_1330(context):
+    """13:30 定时打印排行榜（具名函数，避免lambda序列化风险）"""
+    _log_rankings(context, '13:30')
+
+
+
+def step_buy_1440(context):
+    """14:50 买入"""
+    log.info('[14:50 买入检查]')
+
+    # 1. 先清空未完成委托
+    if is_trade():
+        cancelled = _cancel_open_orders()
+        if cancelled > 0:
+            log.info('[14:50] 已撤销%d笔未完成委托' % cancelled)
+
+    # 2. 同步真实持仓
+    _sync_holding_state(context)
+
+
+    # 3. 如果已有持仓，检查是否需要主动换仓
+    if g.current_holding is not None:
+        # 计算排名（复用排名数据）
+        rankings = calc_realtime_ranking(context)
+        if rankings:
+            top = rankings[0]
+            # 找到当前持仓在排行榜中的20日动量
+            holding_change20 = None
+            for r in rankings:
+                if _same_security(r['code'], g.current_holding):
+                    holding_change20 = r['change20']
+                    break
+
+            if holding_change20 is not None and not _same_security(top['code'], g.current_holding):
+                gap = top['change20'] - holding_change20
+                if gap >= g.switch_threshold:
+                    # 第一名显著领先，触发主动换仓
+                    log.info('[14:50] 主动换仓: %s(%.1f%%) 领先持仓%s(%.1f%%) 达%.1f%%，触发换仓'
+                             % (top['name'], top['change20'],
+                                g.code_name.get(g.current_holding, g.current_holding),
+                                holding_change20, gap))
+                    g.switch_target = top   # 保存目标，卖单成交后由分钟扫描自动买入
+                    _do_sell(context, g.current_holding, '主动换仓')
+                    return
+                else:
+                    log.info('[14:50] 已有持仓 %s，第一名%s领先%.1f%%(<%.1f%%)，维持不换'
+                             % (g.code_name.get(g.current_holding, g.current_holding),
+                                top['name'], gap, g.switch_threshold))
+            else:
+                log.info('[14:50] 已有持仓 %s 排名第一，跳过买入'
+                         % g.code_name.get(g.current_holding, g.current_holding))
+        else:
+            log.info('[14:50] 已有持仓 %s，跳过买入'
+                     % g.code_name.get(g.current_holding, g.current_holding))
+        return
+
+    # 4. 计算排名
+    rankings = calc_realtime_ranking(context)
+    if not rankings:
+        return
+
+    # 5. 选择候选（跳过今日已卖出的，防过热追高）
+    chosen = None
+    skipped_count = 0  # 记录已跳过的候选数量
+    for item in rankings:
+        code6 = item['code'][:6]
+        if code6 in g.sold_today_codes:
+            log.info('[14:50] %s 今日已卖出，跳过' % item['name'])
+            skipped_count += 1
+            continue
+        if item['change13'] <= g.buy_threshold:
+            log.info('[14:50] %s 小波段%.1f%% 未达准入%.1f%%' % (item['name'], item['change13'], g.buy_threshold))
+            skipped_count += 1
+            continue
+        if item['change20'] < g.sell_low:
+            log.info('[14:50] %s 大动量%.1f%% 低于防守线%.1f%%' % (item['name'], item['change20'], g.sell_low))
+            skipped_count += 1
+            continue
+            
+        # 防过热：如果今天涨得太猛，放弃第一名，顺延下一位（买入防追高保护）
+        today_change = _get_today_change(context, item['code'], item['price'])
+        if today_change > g.overheat_today_pct:
+            log.warning('[防过热跳过] %s 虽排前列，但今日已暴涨%.1f%%(起吊线%.1f%%) 极易追高被套，舍弃！递延下一名'
+                        % (item['name'], today_change, g.overheat_today_pct))
+            skipped_count += 1
+            continue
+
+        # 防同日买卖：今日已跌近止损线，买入后极易当天触发止损
+        # 止损线 sell_threshold=-5%，当天已跌-4%时买入缓冲只剩1%，风险过高
+        if today_change <= -4.0:
+            log.warning('[防跌买] %s 今日已跌%.1f%%，接近止损线%.1f%%，跳过，递延下一名'
+                        % (item['name'], today_change, g.sell_threshold))
+            skipped_count += 1
+            continue
+
+        # 递延保护：非第一名时，20日动量不能为负（防止第一名被过滤后买入已转弱的标的）
+        if skipped_count > 0 and item['change20'] < 0:
+            log.warning('[递延拦截] %s 非首选(已跳过%d名)且20日动量%.1f%%为负，放弃买入弱势标的'
+                        % (item['name'], skipped_count, item['change20']))
+            continue
+
+        chosen = item
+        chosen['today_change'] = today_change
+        break
+
+    if chosen is None:
+        log.info('[14:50] 无合格候选标的')
+        return
+
+    log.info('[14:50 买入] 选中 %s 20日%.1f%% 13日%.1f%% | 当日涨幅: %.1f%%(未超%.1f%%安全买入)'
+             % (chosen['name'], chosen['change20'], chosen['change13'], chosen['today_change'], g.overheat_today_pct))
+    _do_buy(context, chosen['code'], chosen['name'])
+
+
+def step_close_1505(context):
+    """15:05 收盘结算"""
+    _sync_holding_state(context)
+    pv = context.portfolio.portfolio_value
+    cash = context.portfolio.cash
+
+    holding_str = '空仓'
+    if g.current_holding:
+        holding_str = '%s(%s)' % (g.current_holding, g.code_name.get(g.current_holding, ''))
+
+    log.info('[15:05 结算] 净值%.2f 现金%.2f 持仓: %s'
+             % (pv, cash, holding_str))
+
+
+# ─────────────────────────────────────────────────────────────
+# 策略主函数
+# ─────────────────────────────────────────────────────────────
+
+def initialize(context):
+    """初始化"""
+    set_parameters(server_restart_not_do_before="1", receive_cancel_response="1")
+
+    # ══════ ETF池（23只）══════
+    g.etf_pool = [
+        {'code': '563300.SS', 'name': '中证2000ETF'},
+        {'code': '159681.SZ', 'name': '创业板50ETF'},
+        {'code': '159845.SZ', 'name': '中证1000ETF'},
+        {'code': '588000.SS', 'name': '科创50ETF'},
+        {'code': '159611.SZ', 'name': '电力ETF'},
+        {'code': '159566.SZ', 'name': '储能电池ETF'},
+        {'code': '516180.SS', 'name': '光伏ETF基金'},
+        {'code': '515980.SS', 'name': '人工智能ETF'},
+        {'code': '515880.SS', 'name': '通信ETF'},
+        {'code': '512480.SS', 'name': '半导体ETF'},
+        {'code': '562500.SS', 'name': '机器人ETF'},
+        {'code': '515170.SS', 'name': '食品饮料ETF'},
+        {'code': '159699.SZ', 'name': '恒生消费ETF'},
+        {'code': '512880.SS', 'name': '证券ETF'},
+        {'code': '159992.SZ', 'name': '创新药ETF'},
+        {'code': '159883.SZ', 'name': '医疗器械ETF'},
+        {'code': '512660.SS', 'name': '军工ETF'},
+        {'code': '515220.SS', 'name': '煤炭ETF'},
+        {'code': '159880.SZ', 'name': '有色ETF基金'},
+        {'code': '518880.SS', 'name': '黄金ETF'},
+        {'code': '162411.SZ', 'name': '华宝油气'},
+        {'code': '513180.SS', 'name': '恒生科技ETF'},
+        {'code': '513100.SS', 'name': '纳指ETF'},
+    ]
+    g.codes = [e['code'] for e in g.etf_pool]
+    g.code_name = {e['code']: e['name'] for e in g.etf_pool}
+
+    # ══════ 读取配置（不存在则创建默认）══════
+    cfg = _load_config()
+
+    g.ranking_period = 20
+    g.buy_period = 13
+    g.max_strategy_capital = float(cfg.get('单次投入金额', 150000))
+    g.trailing_stop_pct = float(cfg.get('移动止损回撤比(%)', 4.0))
+    g.buy_threshold = float(cfg.get('买入准入均线要求(%)', 1.5))
+    g.sell_low = float(cfg.get('买入动量下限(%)', cfg.get('持仓死亡被动割肉线(%)', -2.5)))  # 兼容旧配置名
+    g.sell_threshold = float(cfg.get('当日跌幅卖出阈值(%)', -5.0))
+    # 主动换仓：第一名20日动量超过持仓20日动量多少百分点才触发
+    g.switch_threshold = float(cfg.get('主动换仓动量领先阈值(%)', 3.0))
+    # 防追高：遇到爆拉情况顺延下一名
+    g.overheat_today_pct = float(cfg.get('买入防过热暴涨线(%)', 5.0))
+
+    # ══════ 状态 ══════
+    g.current_holding = None
+    g.highest_price = 0.0
+    g.sold_today_codes = set()
+    g.pending_order = {'code': None, 'side': None, 'order_id': None}
+    g.switch_target = None   # 主动换仓目标（卖出后立刻买入）
+    g.target_buy_shares = 0  # 本次买入目标股数
+    g.buy_retry_count = 0    # 追买重试次数
+
+    # ══════ 加载持久化状态 ══════
+    state = _load_state()
+    g.sold_today_codes = set(state.get('sold_today', []))
+
+    # ══════ 注册定时任务（4个 ≤ 5上限）══════
+    run_daily(context, _log_rankings_1000, time='10:00')
+    run_daily(context, _log_rankings_1330, time='13:30')
+    run_daily(context, step_buy_1440, time='14:50')
+    # 回测有效范围09:31~15:00，15:05超出不执行；交易中00:00~23:59均可
+    run_daily(context, step_close_1505, time='14:59' if not is_trade() else '15:05')
+
+    # ══════ 回测设置 ══════
+    if not is_trade():
+        set_commission(commission_ratio=0.0003)
+        set_slippage(slippage=0.001)
+        set_benchmark('513100.SS')
+        # 回测第一天清空持久化
+        _save_state({'sold_today': [], 'highest_price': 0, 'holding_code': None})
+
+    set_universe(g.codes)
+
+    log.info('=' * 60)
+    log.info('ETF尾盘轮动策略(23半小时版) 初始化完成')
+    log.info('风控: 移动止损%.1f%% | 当日跌幅%.1f%% | 准入13日%.1f%%' % (
+        g.trailing_stop_pct, g.sell_threshold, g.buy_threshold))
+    log.info('[配置生效确认] 单次投入金额=%.0f 移动止损=%.1f%% 准入13日=%.1f%% 当日跌幅=%.1f%% 换仓领先=%.1f%% 防过热=%.1f%%'
+             % (g.max_strategy_capital, g.trailing_stop_pct, g.buy_threshold,
+                g.sell_threshold, g.switch_threshold, g.overheat_today_pct))
+    log.info('=' * 60)
+
+
+def before_trading_start(context, data):
+    """盘前准备"""
+    # 同步持仓
+    _sync_holding_state(context)
+
+    # 加载今日已卖出记录（判断日期，跨天自动清零）
+    import datetime
+    state = _load_state()
+    today_str = context.blotter.current_dt.strftime('%Y-%m-%d')
+    if state.get('trade_date') == today_str:
+        # 当天盘中重启，恢复已卖出记录
+        g.sold_today_codes = set(state.get('sold_today', []))
+    else:
+        # 新的交易日，清零已卖出记录不跨天
+        g.sold_today_codes = set()
+        state['trade_date'] = today_str
+        state['sold_today'] = []
+        _save_state(state)
+
+    # 恢复最高价（持仓代码必须与存档一致，否则清零）
+    if g.current_holding:
+        saved_code = state.get('holding_code', '')
+        saved_price = state.get('highest_price', 0)
+        if saved_price > 0 and saved_code and str(saved_code)[:6] == str(g.current_holding)[:6]:
+            g.highest_price = float(saved_price)
+            log.info('[盘前] 恢复持仓 %s 最高价: %.3f' % (g.current_holding, g.highest_price))
+        else:
+            # 存档代码与实际持仓不符，最高价清零（换仓了但还没更新过）
+            g.highest_price = 0.0
+            log.info('[盘前] 持仓代码变更(%s→%s)，最高价重置' % (saved_code, g.current_holding))
+
+    # 重试计数清零 & 换仓目标跨日清零（防止昨天未执行的换仓买入在今天早盘误触发）
+    g.target_buy_shares = 0
+    g.buy_retry_count = 0
+    g.switch_target = None
+
+    # 过滤停牌标的
+    try:
+        filtered = filter_stock_by_status(g.codes, filter_type=['HALT', 'DELISTING'])
+        g.tradable_codes = filtered if filtered else g.codes[:]
+    except Exception:
+        g.tradable_codes = g.codes[:]
+
+    # 刷新待成交状态
+    _refresh_pending_order()
+
+    log.info('[盘前] 持仓: %s | 已卖出: %s | 可交易: %d只'
+             % (g.current_holding, g.sold_today_codes, len(g.tradable_codes)))
+
+
+def handle_data(context, data):
+    """每分钟扫描（分钟级策略）"""
+    now = context.blotter.current_dt
+    hm = now.strftime('%H:%M')
+
+    # 分钟级风控扫描（09:31 - 14:59）
+    if '09:31' <= hm <= '14:59':
+        _minute_risk_scan(context)
+
+
+# ─────────────────────────────────────────────────────────────
+# 回调函数
+# ─────────────────────────────────────────────────────────────
+
+def on_order_response(context, order_list):
+    """委托主推回调"""
+    if not is_trade():
+        return
+
+    items = _normalize_payload(order_list)
+    if not items:
+        return
+
+    for item in items:
+        try:
+            stock_code = str(item.get('stock_code', ''))
+            status = str(item.get('status', ''))
+            error_info = str(item.get('error_info', '')).strip()
+            entrust_type = str(item.get('entrust_type', ''))
+            entrust_no = str(item.get('entrust_no', ''))
+
+            # 记录异常
+            if error_info:
+                log.error('[委托异常] %s status=%s error=%s' % (stock_code, status, error_info))
+            if status == '9':
+                log.warning('[废单] %s' % stock_code)
+
+            # 终结态刷新待成交
+            if status in ['5', '6', '8', '9']:
+                _refresh_pending_order()
+        except Exception as e:
+            log.warning('[委托回调解析失败] %s' % str(e))
+
+
+def on_trade_response(context, trade_list):
+    """成交主推回调"""
+    if not is_trade():
+        return
+
+    items = _normalize_payload(trade_list)
+    if not items:
+        return
+
+    for item in items:
+        try:
+            stock_code = str(item.get('stock_code', ''))
+            business_amount = float(item.get('business_amount', 0) or 0)
+            business_price = float(item.get('business_price', 0) or 0)
+            entrust_bs = str(item.get('entrust_bs', ''))
+            status = str(item.get('status', ''))
+            cancel_info = str(item.get('cancel_info', '')).strip()
+            real_type = str(item.get('real_type', '0'))
+
+            # 记录原始数据
+            log.info('[成交原始] code=%s bs=%s status=%s real_type=%s amount=%.0f price=%.3f cancel=%s'
+                     % (stock_code, entrust_bs, status, real_type, business_amount, business_price, cancel_info))
+
+            # 撤单回调：real_type='2' 是撤单，business_amount为正数但不是真实成交
+            # cancel_info可能是空格，不能单独依赖它判断
+            if real_type == '2' or cancel_info:
+                log.warning('[撤单成交] %s real_type=%s cancel=%s' % (stock_code, real_type, cancel_info))
+                _refresh_pending_order()
+                continue
+
+            if business_amount <= 0:
+                continue
+
+            # 同步持仓
+            _sync_holding_state(context)
+
+            # 买入成交
+            if entrust_bs == '1':
+                # 将回调的 stock_code 映射回ETF池中的完整代码（回调可能不带后缀或格式不同）
+                mapped_code = stock_code
+                for pool_code in getattr(g, 'codes', []):
+                    if pool_code[:6] == stock_code[:6]:
+                        mapped_code = pool_code
+                        break
+                g.current_holding = mapped_code
+                if g.highest_price <= 0:
+                    g.highest_price = business_price
+                else:
+                    g.highest_price = max(g.highest_price, business_price)
+
+                g.pending_order = {'code': None, 'side': None, 'order_id': None}
+
+                state = _load_state()
+                state['highest_price'] = g.highest_price
+                state['holding_code'] = mapped_code
+                state['sold_today'] = list(g.sold_today_codes)
+                _save_state(state)
+
+                log.info('[买入成交] %s 数量%.0f 价格%.3f' % (mapped_code, business_amount, business_price))
+
+                # 检查是否需要继续追买
+                _check_continue_buy(context, stock_code, business_amount)
+
+            # 卖出成交
+            elif entrust_bs == '2':
+                actual = _sync_holding_state(context)
+                code6 = stock_code[:6]
+                g.sold_today_codes.add(code6)
+
+                state = _load_state()
+                if actual is None:
+                    # 真正空仓，清零最高价
+                    g.current_holding = None
+                    g.highest_price = 0.0
+                    state['highest_price'] = 0
+                    state['holding_code'] = None
+                    log.info('[卖出成交] %s 空仓 数量%.0f 价格%.3f' % (stock_code, business_amount, business_price))
+                else:
+                    # 部分成交，仍有持仓，保留最高价（移动止损继续有效）
+                    state['highest_price'] = g.highest_price
+                    log.info('[卖出成交] %s 部分成交 数量%.0f 价格%.3f 仍持仓%s'
+                             % (stock_code, business_amount, business_price, actual))
+                
+                state['sold_today'] = list(g.sold_today_codes)
+                _save_state(state)
+
+                g.pending_order = {'code': None, 'side': None, 'order_id': None}
+
+            _refresh_pending_order()
+        except Exception as e:
+            log.warning('[成交回调解析失败] %s' % str(e))
+
+
+# 注：追买机制已移除 — ETF流动性足够，限价单会自然成交，无需追买

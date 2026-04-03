@@ -1,0 +1,143 @@
+{
+  "rows": 20030,
+  "codes": 12,
+  "date_min": "2014-01-02",
+  "date_max": "2026-04-01",
+  "duplicate_code_date_rows": 0,
+  "non_positive_close_rows": 0,
+  "null_close_rows": 0,
+  "per_code": [
+    {
+      "code": "159611.SZ",
+      "rows": 1023,
+      "date_min": "2022-01-07",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 7.09
+    },
+    {
+      "code": "159681.SZ",
+      "rows": 784,
+      "date_min": "2023-01-03",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 20.02
+    },
+    {
+      "code": "159992.SZ",
+      "rows": 1448,
+      "date_min": "2020-04-10",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.0
+    },
+    {
+      "code": "162411.SZ",
+      "rows": 2908,
+      "date_min": "2014-01-08",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 30,
+      "max_abs_day_return_pct": 10.09
+    },
+    {
+      "code": "512890.SS",
+      "rows": 1743,
+      "date_min": "2019-01-18",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 9.34
+    },
+    {
+      "code": "513100.SS",
+      "rows": 2975,
+      "date_min": "2014-01-02",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 9.98
+    },
+    {
+      "code": "513180.SS",
+      "rows": 1177,
+      "date_min": "2021-05-25",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.02
+    },
+    {
+      "code": "515880.SS",
+      "rows": 1589,
+      "date_min": "2019-09-06",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.19
+    },
+    {
+      "code": "515980.SS",
+      "rows": 1491,
+      "date_min": "2020-02-10",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.05
+    },
+    {
+      "code": "518880.SS",
+      "rows": 2976,
+      "date_min": "2014-01-02",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.0
+    },
+    {
+      "code": "563300.SS",
+      "rows": 613,
+      "date_min": "2023-09-14",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 10.03
+    },
+    {
+      "code": "588000.SS",
+      "rows": 1303,
+      "date_min": "2020-11-16",
+      "date_max": "2026-04-01",
+      "duplicate_rows": 0,
+      "null_close_rows": 0,
+      "non_positive_close_rows": 0,
+      "max_calendar_gap_days": 11,
+      "max_abs_day_return_pct": 20.0
+    }
+  ]
+}

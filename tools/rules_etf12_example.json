@@ -1,0 +1,24 @@
+{
+  "rules": [
+    {
+      "name": "当天涨超5且20日涨超12",
+      "filter": "ret1 > 0.05 and ret20 > 0.12",
+      "min_samples": 5
+    },
+    {
+      "name": "3日涨超6且20日涨超12",
+      "filter": "ret3 > 0.06 and ret20 > 0.12",
+      "min_samples": 5
+    },
+    {
+      "name": "3日涨超6但20日涨幅不高",
+      "filter": "ret3 > 0.06 and ret20 <= 0.12",
+      "min_samples": 5
+    },
+    {
+      "name": "20日涨超15且偏离5日均线超4",
+      "filter": "ret20 > 0.15 and bias5 > 0.04",
+      "min_samples": 5
+    }
+  ]
+}

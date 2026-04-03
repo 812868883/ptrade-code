@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push:*)",
+      "Bash(gh auth:*)",
+      "Bash(git remote:*)",
+      "Bash(python ptrade策略检查脚本.py \"../etf实盘_23半小时_修复版.txt\")",
+      "Bash(python docs/ptrade策略检查脚本.py \"etf实盘_23半小时_修复版.txt\")"
+    ]
+  }
+}
