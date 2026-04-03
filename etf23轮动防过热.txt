@@ -352,16 +352,6 @@ def _sync_holding_state(context):
     return actual
 
 
-def _find_other_strategy_holdings(context):
-    """找出账户中其他策略（非本ETF池）持有的股票"""
-    other = []
-    positions = context.portfolio.positions
-    for code in positions:
-        if positions[code].amount > 0 and not _is_strategy_security(code):
-            other.append(code)
-    return other
-
-
 def _update_highest_price(code, price):
     """更新持仓最高价并持久化"""
     if price <= 0:
@@ -422,8 +412,8 @@ def _get_today_change(context, code, current_price=None):
 # ─────────────────────────────────────────────────────────────
 
 def calc_realtime_ranking(context):
-    """计算ETF实时20日动量排名"""
-    rankings = []
+    """计算ETF实时20日动量排名，返回 (正动量排名, 全部排名)"""
+    all_rankings = []
     need_bars = g.ranking_period + 5
 
     for code in g.tradable_codes:
@@ -450,20 +440,20 @@ def calc_realtime_ranking(context):
             else:
                 c13 = 0.0
 
-            # 只排动量为正的标的，负动量不参与排名
-            if c20 > 0:
-                rankings.append({
-                    'code': code,
-                    'name': g.code_name.get(code, code),
-                    'change20': c20,
-                    'change13': c13,
-                    'price': today_price,
-                })
+            all_rankings.append({
+                'code': code,
+                'name': g.code_name.get(code, code),
+                'change20': c20,
+                'change13': c13,
+                'price': today_price,
+            })
         except Exception as e:
             log.error('[排名异常] %s: %s' % (code, str(e)))
 
-    rankings.sort(key=lambda x: x['change20'], reverse=True)
-    return rankings
+    all_rankings.sort(key=lambda x: x['change20'], reverse=True)
+    # 正动量排名：只保留20日动量>0的标的
+    positive_rankings = [r for r in all_rankings if r['change20'] > 0]
+    return positive_rankings, all_rankings
 
 
 # ─────────────────────────────────────────────────────────────
@@ -676,10 +666,10 @@ def _minute_risk_scan(context):
     triggered = False
     reason = ''
 
-    # 条件1：移动止损回撤
+    # 条件1：从最高价回撤止损
     if drawdown >= g.trailing_stop_pct:
         triggered = True
-        reason = '移动止损(回撤%.2f%%)' % drawdown
+        reason = '止损(从最高价%.3f回撤%.2f%%)' % (g.highest_price, drawdown)
 
     # 条件2：今日跌幅过大
     if change_today <= g.sell_threshold:
@@ -699,18 +689,16 @@ def _minute_risk_scan(context):
 
 def _log_rankings(context, time_label):
     """打印排行榜"""
-    rankings = calc_realtime_ranking(context)
+    rankings, _ = calc_realtime_ranking(context)
     if not rankings:
         log.warning('[%s 排行榜] 无有效数据' % time_label)
-        return rankings
+        return
 
     log.info('[%s 排行榜] 资金流入前锋榜 Top5:' % time_label)
     for i, r in enumerate(rankings[:5]):
-        marker = ' [🔥持仓]' if (g.current_holding and _same_security(r['code'], g.current_holding)) else ''
+        marker = ' [持仓]' if (g.current_holding and _same_security(r['code'], g.current_holding)) else ''
         log.info('  No.%d %s | 20日%.1f%% 13日%.1f%% %s'
                  % (i + 1, r['name'], r['change20'], r['change13'], marker))
-
-    return rankings
 
 
 def _log_rankings_1000(context):
@@ -738,52 +726,63 @@ def step_buy_1440(context):
     _sync_holding_state(context)
 
 
-    # 3. 如果已有持仓，检查是否需要主动换仓
+    # 3. 计算排名（正动量排名 + 全部排名）
+    rankings, all_rankings = calc_realtime_ranking(context)
+
+    # 4. 如果已有持仓，检查是否需要主动换仓
     if g.current_holding is not None:
-        # 计算排名（复用排名数据）
-        rankings = calc_realtime_ranking(context)
         if rankings:
             top = rankings[0]
-            # 找到当前持仓在排行榜中的20日动量
+            # 从全部排名中找持仓的20日动量（持仓可能动量为负，不在正排名中）
             holding_change20 = None
-            for r in rankings:
+            for r in all_rankings:
                 if _same_security(r['code'], g.current_holding):
                     holding_change20 = r['change20']
                     break
 
-            if holding_change20 is not None and not _same_security(top['code'], g.current_holding):
+            if holding_change20 is None:
+                # 持仓标的无数据（停牌等），维持不动
+                log.info('[14:50] 持仓 %s 无排名数据，维持'
+                         % g.code_name.get(g.current_holding, g.current_holding))
+            elif holding_change20 <= 0:
+                # 持仓动量为负，强制换仓到第一名
+                log.warning('[14:50] 持仓 %s 20日动量%.1f%%已转负，强制换仓到 %s(%.1f%%)'
+                            % (g.code_name.get(g.current_holding, g.current_holding),
+                               holding_change20, top['name'], top['change20']))
+                g.switch_target = top
+                _do_sell(context, g.current_holding, '动量转负强制换仓')
+            elif _same_security(top['code'], g.current_holding):
+                log.info('[14:50] 已有持仓 %s 排名第一，跳过'
+                         % g.code_name.get(g.current_holding, g.current_holding))
+            else:
                 gap = top['change20'] - holding_change20
                 if gap >= g.switch_threshold:
-                    # 第一名显著领先，触发主动换仓
                     log.info('[14:50] 主动换仓: %s(%.1f%%) 领先持仓%s(%.1f%%) 达%.1f%%，触发换仓'
                              % (top['name'], top['change20'],
                                 g.code_name.get(g.current_holding, g.current_holding),
                                 holding_change20, gap))
-                    g.switch_target = top   # 保存目标，卖单成交后由分钟扫描自动买入
+                    g.switch_target = top
                     _do_sell(context, g.current_holding, '主动换仓')
-                    return
                 else:
                     log.info('[14:50] 已有持仓 %s，第一名%s领先%.1f%%(<%.1f%%)，维持不换'
                              % (g.code_name.get(g.current_holding, g.current_holding),
                                 top['name'], gap, g.switch_threshold))
-            else:
-                log.info('[14:50] 已有持仓 %s 排名第一，跳过买入'
-                         % g.code_name.get(g.current_holding, g.current_holding))
         else:
-            log.info('[14:50] 已有持仓 %s，跳过买入'
-                     % g.code_name.get(g.current_holding, g.current_holding))
+            # 全市场无正动量标的，持仓动量也为负，清仓
+            log.warning('[14:50] 无正动量标的，清仓 %s'
+                        % g.code_name.get(g.current_holding, g.current_holding))
+            _do_sell(context, g.current_holding, '全市场无正动量，清仓')
         return
 
-    # 4. 计算排名
-    rankings = calc_realtime_ranking(context)
+    # 5. 无持仓：市场弱势检查（用全部排名，含负动量）
     if not rankings:
+        log.info('[14:50] 无正动量标的，不买入')
         return
 
-    # 5. 市场整体弱势检查：第二名20日或13日动量任一为负，今天不买
-    if len(rankings) >= 2:
-        r2 = rankings[1]
+    if len(all_rankings) >= 2:
+        r2 = all_rankings[1]
         if r2['change20'] < 0 or r2['change13'] < 0:
-            log.warning('[14:50] 第二名 %s 20日%.1f%% 13日%.1f%% 有负值，市场偏弱，今日不买入'
+            log.warning('[14:50] 全排名第二 %s 20日%.1f%% 13日%.1f%% 有负值，市场偏弱，今日不买入'
                         % (r2['name'], r2['change20'], r2['change13']))
             return
 
@@ -1100,7 +1099,7 @@ def on_trade_response(context, trade_list):
                     state['holding_code'] = None
                     log.info('[卖出成交] %s 空仓 数量%.0f 价格%.3f' % (stock_code, business_amount, business_price))
                 else:
-                    # 部分成交，仍有持仓，保留最高价（移动止损继续有效）
+                    # 部分成交，仍有持仓，保留最高价（止损继续有效）
                     state['highest_price'] = g.highest_price
                     log.info('[卖出成交] %s 部分成交 数量%.0f 价格%.3f 仍持仓%s'
                              % (stock_code, business_amount, business_price, actual))
