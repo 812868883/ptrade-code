@@ -779,7 +779,13 @@ def step_buy_1440(context):
     if not rankings:
         return
 
-    # 5. 选择候选（跳过今日已卖出的，防过热追高）
+    # 5. 市场整体弱势检查：第二名20日动量为负，今天不买
+    if len(rankings) >= 2 and rankings[1]['change20'] < 0:
+        log.warning('[14:50] 第二名 %s 20日动量%.1f%%为负，市场整体偏弱，今日不买入'
+                    % (rankings[1]['name'], rankings[1]['change20']))
+        return
+
+    # 6. 选择候选（跳过今日已卖出的，防过热追高）
     chosen = None
     skipped_count = 0  # 记录已跳过的候选数量
     for item in rankings:
