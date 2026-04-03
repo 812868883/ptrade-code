@@ -5,14 +5,14 @@ import json
 # ─────────────────────────────────────────────────────────────
 # 核心逻辑：
 #   - 每分钟扫描跌幅，触发阈值立即卖出
-#   - 14:50 买入（继续追买直到满额）
+#   - 14:50 买入
 #   - 10:00/13:30 打印排行榜
 #   - 15:05 结算日志
 #
 # 时间表：
 #   10:00  打印盘中前锋榜
 #   13:30  打印盘中前锋榜
-#   14:50  买入新标的（继续追买直到满额）
+#   14:50  买入新标的
 #   15:05  收盘结算日志
 #   每分钟(09:31-14:59) 扫描跌幅，触发则偷袭卖出
 # ═══════════════════════════════════════════════════════════════
@@ -50,8 +50,6 @@ def _save_json(filename, data):
         with open(tmp_path, 'w', encoding='utf-8') as f:
             f.write(json.dumps(data, ensure_ascii=False, indent=2))
         # 原子替换：rename 是操作系统级原子操作
-        if os.path.exists(path):
-            os.remove(path)
         os.rename(tmp_path, path)
     except Exception as e:
         log.error('[硬盘写入失败] %s: %s' % (filename, str(e)))
@@ -536,12 +534,12 @@ def _do_sell(context, code, reason):
 
 
 # ─────────────────────────────────────────────────────────────
-# 买入执行（支持部分成交继续追买）
+# 买入执行
 # ─────────────────────────────────────────────────────────────
 
-def _do_buy(context, code, name, target_shares=None):
-    """执行买入（target_shares=None表示新目标，-1表示继续追剩余）"""
-    log.info('[买入] %s(%s) 目标股数: %s' % (code, name, target_shares if target_shares else '新单'))
+def _do_buy(context, code, name):
+    """执行买入"""
+    log.info('[买入] %s(%s)' % (code, name))
 
     # 检查涨跌停
     try:
@@ -552,12 +550,11 @@ def _do_buy(context, code, name, target_shares=None):
     except Exception:
         pass
 
-    # 检查是否有未完成买单（回测/实盘均检查，换仓路径也防重复下单）
-    if target_shares is None:  # 新目标
-        pending = g.pending_order
-        if pending.get('side') == 'buy' and _same_security(pending.get('code'), code):
-            log.info('[买入] 已有未完成买单，等待')
-            return
+    # 检查是否有未完成买单（防重复下单）
+    pending = g.pending_order
+    if pending.get('side') == 'buy' and _same_security(pending.get('code'), code):
+        log.info('[买入] 已有未完成买单，等待')
+        return
 
     if is_trade():
         buy_price = _get_live_price(code, direction='buy')
@@ -571,19 +568,14 @@ def _do_buy(context, code, name, target_shares=None):
         return
 
     # 计算买入股数
-    if target_shares is None:  # 新目标
-        cash = context.portfolio.cash
-        target_cash = min(cash, g.max_strategy_capital)
-        available = target_cash * 0.98
-        shares = int(available / buy_price)
-        shares = (shares // 100) * 100  # 100股整数
-        if shares <= 0:
-            log.info('[买入] 资金不足')
-            return
-        g.target_buy_shares = shares  # 记录目标股数
-        g.buy_retry_count = 0  # 重试计数清零
-    else:
-        shares = target_shares  # 继续追买
+    cash = context.portfolio.cash
+    target_cash = min(cash, g.max_strategy_capital)
+    available = target_cash * 0.98
+    shares = int(available / buy_price)
+    shares = (shares // 100) * 100  # 100股整数
+    if shares <= 0:
+        log.info('[买入] 资金不足')
+        return
 
     log.info('[买入] 报价%.3f 数量%d' % (buy_price, shares))
 
@@ -912,8 +904,6 @@ def initialize(context):
     g.sold_today_codes = set()
     g.pending_order = {'code': None, 'side': None, 'order_id': None}
     g.switch_target = None   # 主动换仓目标（卖出后立刻买入）
-    g.target_buy_shares = 0  # 本次买入目标股数
-    g.buy_retry_count = 0    # 追买重试次数
 
     # ══════ 加载持久化状态 ══════
     state = _load_state()
@@ -977,9 +967,7 @@ def before_trading_start(context, data):
             g.highest_price = 0.0
             log.info('[盘前] 持仓代码变更(%s→%s)，最高价重置' % (saved_code, g.current_holding))
 
-    # 重试计数清零 & 换仓目标跨日清零（防止昨天未执行的换仓买入在今天早盘误触发）
-    g.target_buy_shares = 0
-    g.buy_retry_count = 0
+    # 换仓目标跨日清零（防止昨天未执行的换仓买入在今天早盘误触发）
     g.switch_target = None
 
     # 过滤停牌标的
@@ -1100,9 +1088,6 @@ def on_trade_response(context, trade_list):
 
                 log.info('[买入成交] %s 数量%.0f 价格%.3f' % (mapped_code, business_amount, business_price))
 
-                # 检查是否需要继续追买
-                _check_continue_buy(context, stock_code, business_amount)
-
             # 卖出成交
             elif entrust_bs == '2':
                 actual = _sync_holding_state(context)
@@ -1133,4 +1118,3 @@ def on_trade_response(context, trade_list):
             log.warning('[成交回调解析失败] %s' % str(e))
 
 
-# 注：追买机制已移除 — ETF流动性足够，限价单会自然成交，无需追买
