@@ -451,8 +451,8 @@ def calc_realtime_ranking(context):
             log.error('[排名异常] %s: %s' % (code, str(e)))
 
     all_rankings.sort(key=lambda x: x['change20'], reverse=True)
-    # 正动量排名：只保留20日动量>0的标的
-    positive_rankings = [r for r in all_rankings if r['change20'] > 0]
+    # 正动量排名：20日和13日动量都为正才纳入
+    positive_rankings = [r for r in all_rankings if r['change20'] > 0 and r['change13'] > 0]
     return positive_rankings, all_rankings
 
 
