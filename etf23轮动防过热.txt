@@ -70,9 +70,8 @@ def _create_default_config():
     """创建默认配置文件"""
     config = {
         "单次投入金额": 150000,
-        "移动止损回撤比(%)": 4.0,
+        "止损回撤比(%)": 5.0,
         "买入准入均线要求(%)": 1.5,
-        "买入动量下限(%)": -2.5,
         "当日跌幅卖出阈值(%)": -5.0,
         "主动换仓动量领先阈值(%)": 3.0,
         "买入防过热暴涨线(%)": 5.0
@@ -95,9 +94,8 @@ def _load_config():
 
     defaults = {
         "单次投入金额": 150000,
-        "移动止损回撤比(%)": 4.0,
+        "止损回撤比(%)": 5.0,
         "买入准入均线要求(%)": 1.5,
-        "买入动量下限(%)": -2.5,
         "当日跌幅卖出阈值(%)": -5.0,
         "主动换仓动量领先阈值(%)": 3.0,
         "买入防过热暴涨线(%)": 5.0
@@ -452,13 +450,15 @@ def calc_realtime_ranking(context):
             else:
                 c13 = 0.0
 
-            rankings.append({
-                'code': code,
-                'name': g.code_name.get(code, code),
-                'change20': c20,
-                'change13': c13,
-                'price': today_price,
-            })
+            # 只排动量为正的标的，负动量不参与排名
+            if c20 > 0:
+                rankings.append({
+                    'code': code,
+                    'name': g.code_name.get(code, code),
+                    'change20': c20,
+                    'change13': c13,
+                    'price': today_price,
+                })
         except Exception as e:
             log.error('[排名异常] %s: %s' % (code, str(e)))
 
@@ -800,10 +800,6 @@ def step_buy_1440(context):
             log.info('[14:50] %s 小波段%.1f%% 未达准入%.1f%%' % (item['name'], item['change13'], g.buy_threshold))
             skipped_count += 1
             continue
-        if item['change20'] < g.sell_low:
-            log.info('[14:50] %s 大动量%.1f%% 低于防守线%.1f%%' % (item['name'], item['change20'], g.sell_low))
-            skipped_count += 1
-            continue
             
         # 防过热：如果今天涨得太猛，放弃第一名，顺延下一位（买入防追高保护）
         today_change = _get_today_change(context, item['code'], item['price'])
@@ -819,12 +815,6 @@ def step_buy_1440(context):
             log.warning('[防跌买] %s 今日已跌%.1f%%，接近止损线%.1f%%，跳过，递延下一名'
                         % (item['name'], today_change, g.sell_threshold))
             skipped_count += 1
-            continue
-
-        # 递延保护：非第一名时，20日动量不能为负（防止第一名被过滤后买入已转弱的标的）
-        if skipped_count > 0 and item['change20'] < 0:
-            log.warning('[递延拦截] %s 非首选(已跳过%d名)且20日动量%.1f%%为负，放弃买入弱势标的'
-                        % (item['name'], skipped_count, item['change20']))
             continue
 
         chosen = item
@@ -897,9 +887,8 @@ def initialize(context):
     g.ranking_period = 20
     g.buy_period = 13
     g.max_strategy_capital = float(cfg.get('单次投入金额', 150000))
-    g.trailing_stop_pct = float(cfg.get('移动止损回撤比(%)', 4.0))
+    g.trailing_stop_pct = float(cfg.get('止损回撤比(%)', 5.0))
     g.buy_threshold = float(cfg.get('买入准入均线要求(%)', 1.5))
-    g.sell_low = float(cfg.get('买入动量下限(%)', cfg.get('持仓死亡被动割肉线(%)', -2.5)))  # 兼容旧配置名
     g.sell_threshold = float(cfg.get('当日跌幅卖出阈值(%)', -5.0))
     # 主动换仓：第一名20日动量超过持仓20日动量多少百分点才触发
     g.switch_threshold = float(cfg.get('主动换仓动量领先阈值(%)', 3.0))
@@ -936,9 +925,9 @@ def initialize(context):
 
     log.info('=' * 60)
     log.info('ETF尾盘轮动策略(23半小时版) 初始化完成')
-    log.info('风控: 移动止损%.1f%% | 当日跌幅%.1f%% | 准入13日%.1f%%' % (
+    log.info('风控: 止损回撤%.1f%% | 当日跌幅%.1f%% | 准入13日%.1f%%' % (
         g.trailing_stop_pct, g.sell_threshold, g.buy_threshold))
-    log.info('[配置生效确认] 单次投入金额=%.0f 移动止损=%.1f%% 准入13日=%.1f%% 当日跌幅=%.1f%% 换仓领先=%.1f%% 防过热=%.1f%%'
+    log.info('[配置生效确认] 单次投入金额=%.0f 止损回撤=%.1f%% 准入13日=%.1f%% 当日跌幅=%.1f%% 换仓领先=%.1f%% 防过热=%.1f%%'
              % (g.max_strategy_capital, g.trailing_stop_pct, g.buy_threshold,
                 g.sell_threshold, g.switch_threshold, g.overheat_today_pct))
     log.info('=' * 60)
